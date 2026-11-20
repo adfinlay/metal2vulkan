@@ -29,7 +29,7 @@ fn the_shadow_load_is_valid_where_the_device_has_what_it_needs() {
         let profile = device.profile();
         for form in EVERY_FORM {
             let m = || {
-                extended_shadow_typed_module(form)
+                extended_shadow_typed_module_for(profile, form)
                     .expect("a measured form")
                     .expect("built")
             };
@@ -51,7 +51,10 @@ fn the_shadow_load_is_valid_where_the_device_has_what_it_needs() {
             }
         }
         for form in UNMEASURED {
-            assert!(extended_shadow_typed_module(form).is_none(), "{form:?}");
+            assert!(
+                extended_shadow_typed_module_for(profile, form).is_none(),
+                "{form:?}"
+            );
             match extended_shadow_module(&device, form) {
                 Err(Error::Unsupported(u)) => assert_eq!(
                     u,
@@ -80,8 +83,10 @@ fn each_texel_of_the_shadow_takes_its_codes_tile_value() {
     ];
     // The `_sRGB` forms' decode takes the transfer by the device's `Pow`, which the interpreter
     // does not model: their tile values are the device's.
-    for form in EVERY_FORM.into_iter().filter(|f| !f.srgb()) {
-        let m = extended_shadow_typed_module(form)
+    let forms = EVERY_FORM.into_iter().filter(|f| !f.srgb());
+    let quantizes = [QuantizeForm::Device, QuantizeForm::Controlled];
+    for (form, quantize) in forms.flat_map(|f| quantizes.map(|q| (f, q))) {
+        let m = extended_shadow_typed_module(form, quantize)
             .expect("a measured form")
             .expect("built");
         let alpha = |c: u32| match form {
@@ -107,15 +112,61 @@ fn each_texel_of_the_shadow_takes_its_codes_tile_value() {
             };
             let images = vec![codes.clone(), shadow.clone()];
             let (_, images) = run_with_images(&m, &cfg, Resources::default(), images).expect("run");
-            assert_eq!(images[0], codes, "{form:?}: the codes stay");
+            assert_eq!(images[0], codes, "{form:?} {quantize:?}: the codes stay");
             for y in 0..height {
                 for x in 0..width {
                     let n = y * width + x;
                     let at = images[1].index(0, 0, 0, [x, y, 0]).expect("inside");
                     let want = tile_model(form, codes_of(n % 1024)).map(f32::to_bits);
-                    assert_eq!(images[1].texels[at], want, "{form:?} ({x}, {y}) {order:?}");
+                    assert_eq!(
+                        images[1].texels[at], want,
+                        "{form:?} {quantize:?} ({x}, {y}) {order:?}"
+                    );
                 }
             }
         }
     }
+}
+
+/// A device with `shaderFloat16` rounds the load's lanes as its draws do, by its conversion to 16
+/// bits and back (the module docs), never by `OpQuantizeToF16`, which hung an RTX 3080 Ti
+/// (NVIDIA 550.163.01) at every dispatch of the load; under the controlled form the entry
+/// declares `RoundingModeRTE` for 16 bits. A device without `shaderFloat16` keeps the quantize.
+#[test]
+fn the_shadow_load_rounds_as_the_devices_draws_do() {
+    const QUANTIZE_TO_F16: u32 = 116;
+    const EXECUTION_MODE: u32 = 16;
+    const ROUNDING_MODE_RTE: u32 = 4462;
+    let mut converted = 0;
+    for (name, device) in committed_devices() {
+        let profile = device.profile();
+        let quantize = narrow::quantize_form(profile);
+        for form in EVERY_FORM {
+            let Ok(module) = extended_shadow_module(&device, form) else {
+                continue;
+            };
+            let words = &module.spirv;
+            let mut at = 5;
+            let (mut quantizes, mut rte16) = (false, false);
+            while at < words.len() {
+                let count = ((words[at] >> 16) as usize).max(1);
+                quantizes |= words[at] & 0xffff == QUANTIZE_TO_F16;
+                rte16 |= words[at] & 0xffff == EXECUTION_MODE
+                    && words.get(at + 2..at + 4) == Some(&[ROUNDING_MODE_RTE, 16]);
+                at += count;
+            }
+            assert_eq!(
+                quantizes,
+                quantize == QuantizeForm::Device,
+                "{name} {form:?} in {quantize:?}"
+            );
+            assert_eq!(
+                rte16,
+                quantize == QuantizeForm::Controlled,
+                "{name} {form:?}: RoundingModeRTE 16"
+            );
+            converted += usize::from(quantize == QuantizeForm::Controlled);
+        }
+    }
+    assert!(converted > 0, "no committed device converts");
 }

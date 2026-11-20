@@ -23,6 +23,15 @@
 //! `⌈width / 8⌉ × ⌈height / 8⌉` workgroups over the shadow's extent, which lies inside the
 //! attachment's.
 //!
+//! **Rounding.** Each lane rounds to `half` in the device's [`QuantizeForm`]
+//! (`narrow::quantize_form`), as every module the device's draws run does: on a profile with
+//! `shaderFloat16` and the float controls that make it Metal's, the conversion to 16 bits and
+//! back, the entry declaring those controls (`narrow::controlled_modes`); the device's
+//! `OpQuantizeToF16` only on a profile without `shaderFloat16`. The quantize hung an RTX 3080 Ti
+//! (NVIDIA 550.163.01, Linux) at every dispatch of this module, one workgroup's too (Xid 109,
+//! `CTX SWITCH TIMEOUT`), where the module's conversion form completes; the device's draws never
+//! quantize there, as the profile has `shaderFloat16`.
+//!
 //! **Synchronization** (consumer): the codes' last writes → `SHADER_STORAGE_READ` in
 //! `COMPUTE_SHADER`, and the shadow's last reads and writes → `SHADER_STORAGE_WRITE` there,
 //! before the dispatch; its writes → the fragment shader's reads and writes of the shadow after.
@@ -30,13 +39,13 @@
 use std::sync::Arc;
 
 use crate::device::requirements::Requirements;
-use crate::device::Device;
+use crate::device::{Device, DeviceProfile};
 use crate::error::{Error, Feature, Unsupported};
-use crate::lower::arith::extended_range;
+use crate::lower::arith::{extended_range, narrow};
 use crate::metal::format::ExtendedRange;
 use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
-use crate::spirv::builder::ModuleBuilder;
+use crate::spirv::builder::{ModuleBuilder, QuantizeForm};
 use crate::spirv::error::BResult;
 use crate::spirv::ir::{
     BinOp, Dim, ExecMode, ExecModel, ImageOperands, ImageQuery, ImageType, ImageUsage, IoDir,
@@ -50,7 +59,8 @@ pub struct ExtendedShadowModule {
     /// SPIR-V 1.5 words, entry point `main`, bindings numbered as below in set 0.
     pub spirv: Arc<[u32]>,
     /// What the module needs from the device: the raw format's typed storage access
-    /// (`shaderStorageImageExtendedFormats` for `R32G32_UINT`).
+    /// (`shaderStorageImageExtendedFormats` for `R32G32_UINT`), and in the conversion forms
+    /// `shaderFloat16` and the float controls the entry declares (the module docs).
     pub requirements: Requirements,
 }
 
@@ -81,16 +91,44 @@ const SHADOW: ResourceSlot = ResourceSlot {
 /// The shadow load of `form` as a typed module, before serialization: the module
 /// [`extended_shadow_module`] serializes. `None` for a form whose tile memory is unmeasured (a
 /// padded or bfloat form) or whose raw format has no typed storage declaration.
-pub(crate) fn extended_shadow_typed_module(form: ExtendedRange) -> Option<BResult<TypedModule>> {
+/// Each lane rounds to `half` in `quantize` (the module docs); the caller declares the float
+/// controls of the conversion forms ([`extended_shadow_typed_module_for`] does).
+pub(crate) fn extended_shadow_typed_module(
+    form: ExtendedRange,
+    quantize: QuantizeForm,
+) -> Option<BResult<TypedModule>> {
     if form.padded() || form.bfloat() {
         return None;
     }
     let declared = crate::metal::format::spirv_image_format(form.raw_format())?;
-    Some(build(form, declared))
+    Some(build(form, declared, quantize))
 }
 
-fn build(form: ExtendedRange, declared: crate::spv::ImageFormat) -> BResult<TypedModule> {
+/// [`extended_shadow_typed_module`] as `profile` takes it: in the profile's quantize form
+/// (`narrow::quantize_form`), the entry declaring the float controls of the controlled form
+/// (`narrow::controlled_modes`).
+pub(crate) fn extended_shadow_typed_module_for(
+    profile: &DeviceProfile,
+    form: ExtendedRange,
+) -> Option<BResult<TypedModule>> {
+    let quantize = narrow::quantize_form(profile);
+    let built = extended_shadow_typed_module(form, quantize)?;
+    Some(built.and_then(|mut m| {
+        if quantize == QuantizeForm::Controlled {
+            let modes = narrow::controlled_modes(profile).unwrap_or_default();
+            m.declare_modes(&modes)?;
+        }
+        Ok(m)
+    }))
+}
+
+fn build(
+    form: ExtendedRange,
+    declared: crate::spv::ImageFormat,
+    quantize: QuantizeForm,
+) -> BResult<TypedModule> {
     let mut b = ModuleBuilder::new();
+    b.set_quantize_form(quantize);
     let u32_ = b.ty(Type::Int {
         width: 32,
         signed: false,
@@ -175,10 +213,10 @@ pub fn extended_shadow_module(
     device: &Device,
     form: ExtendedRange,
 ) -> Result<ExtendedShadowModule, Error> {
-    let Some(m) = extended_shadow_typed_module(form) else {
+    let profile = device.profile();
+    let Some(m) = extended_shadow_typed_module_for(profile, form) else {
         return Err(Unsupported::not_implemented(Feature::Format).into());
     };
-    let profile = device.profile();
     let m = m?;
     profile
         .check(m.requirements())
